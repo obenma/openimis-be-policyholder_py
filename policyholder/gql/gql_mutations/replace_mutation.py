@@ -4,9 +4,10 @@ from policyholder.gql.gql_mutations import PolicyHolderInsureeReplaceInputType, 
 from core.gql.gql_mutations.base_mutation import BaseReplaceMutation, BaseHistoryModelReplaceMutationMixin
 from policyholder.models import PolicyHolderInsuree, PolicyHolderContributionPlan, PolicyHolderUser
 from policyholder.validation.permission_validation import PermissionValidation
+from policyholder.gql.gql_mutations import LiveTargetMixin
 
 
-class ReplacePolicyHolderInsureeMutation(BaseHistoryModelReplaceMutationMixin, BaseReplaceMutation):
+class ReplacePolicyHolderInsureeMutation(LiveTargetMixin, BaseHistoryModelReplaceMutationMixin, BaseReplaceMutation):
     _mutation_class = "PolicyHolderInsureeMutation"
     _mutation_module = "policyholder"
     _model = PolicyHolderInsuree
@@ -20,7 +21,9 @@ class ReplacePolicyHolderInsureeMutation(BaseHistoryModelReplaceMutationMixin, B
         PermissionValidation.validate_perms(user, PolicyholderConfig.gql_mutation_replace_policyholderinsuree_perms)
 
 
-class ReplacePolicyHolderContributionPlanMutation(BaseHistoryModelReplaceMutationMixin, BaseReplaceMutation):
+class ReplacePolicyHolderContributionPlanMutation(
+        LiveTargetMixin, BaseHistoryModelReplaceMutationMixin, BaseReplaceMutation
+):
     _mutation_class = "PolicyHolderContributionPlanMutation"
     _mutation_module = "policyholder"
     _model = PolicyHolderContributionPlan
@@ -34,7 +37,7 @@ class ReplacePolicyHolderContributionPlanMutation(BaseHistoryModelReplaceMutatio
         PermissionValidation.validate_perms(user, PolicyholderConfig.gql_mutation_replace_policyholdercontributionplan_perms)
 
 
-class ReplacePolicyHolderUserMutation(BaseHistoryModelReplaceMutationMixin, BaseReplaceMutation):
+class ReplacePolicyHolderUserMutation(LiveTargetMixin, BaseHistoryModelReplaceMutationMixin, BaseReplaceMutation):
     _mutation_class = "PolicyHolderUserMutation"
     _mutation_module = "policyholder"
     _model = PolicyHolderUser
@@ -45,7 +48,7 @@ class ReplacePolicyHolderUserMutation(BaseHistoryModelReplaceMutationMixin, Base
             data.pop('client_mutation_id')
         if "client_mutation_label" in data:
             data.pop('client_mutation_label')
-        object_to_replace = cls._model.objects.filter(id=data['uuid']).first()
+        object_to_replace = cls._target_queryset(user).filter(id=data['uuid']).first()
         if object_to_replace is None:
             cls._object_not_exist_exception(data['uuid'])
         else:
