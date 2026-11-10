@@ -1,9 +1,11 @@
 
+import datetime as py_datetime
+
 from contribution_plan.models import ContributionPlanBundle
 from django.conf import settings
 from django.db import models
+from django.db.models import Q
 from core import models as core_models
-from graphql import ResolveInfo
 from location.models import Location, LocationManager
 from insuree.models import Insuree
 from policy.models import Policy
@@ -36,15 +38,75 @@ class PolicyHolder(core_models.HistoryBusinessModel):
     objects = PolicyHolderManager()
 
     @classmethod
+    def get_rights(cls, action):
+        """
+        The rights governing an action on this entity, for GraphQL, REST and FHIR.
+
+        Redeclares nothing: the rights table is `policyholder.apps.DJANGO_PERMS`, by
+        entity then by action. The read happens inside the method and not at import
+        time, because the `_perms` keys only hold their value after `ready()`.
+
+        The `*Portal` actions (`queryPortal`, `queryPaymentPortal`,
+        `queryInsureePolicyPortal`) are distinct from their back-office counterparts:
+        they only grant the action over the policy holders the user is attached to. The
+        right alone is therefore not enough, membership is needed too - see
+        `has_hybrid_phu_perms` at the bottom of this file.
+        """
+        from policyholder.apps import configured_perms
+
+        return configured_perms("policyHolder", action)
+
+    @classmethod
+    def membership_ids(cls, user):
+        """Ids of the policy holders ``user`` is currently attached to (PolicyHolderUser)."""
+        # The standard library datetime, not core's calendar-aware one: Django's
+        # date fields reject the latter when the calendar is not Gregorian.
+        now = py_datetime.datetime.now()
+        return PolicyHolderUser.objects.filter(
+            Q(date_valid_to__isnull=True) | Q(date_valid_to__gte=now),
+            date_valid_from__lte=now,
+            is_deleted=False,
+            user_id=user.id,
+        ).values("policy_holder_id")
+
+    @classmethod
+    def filter_membership(cls, user, prefix=""):
+        """``Q`` objects narrowing rows to the policy holders ``user`` is attached to.
+
+        Shaped like ``filter_location``: ``prefix`` is the path from the queryset
+        being filtered to PolicyHolder, including the trailing ``__``. This is what
+        the portal rights mean - they grant an action over the user's own policy
+        holders only - so a resolver applies it whenever the user reached it
+        through a portal right rather than the back-office one.
+        """
+        user = cls.scoping_user(user)
+        if user is None or getattr(user, "is_anonymous", True):
+            return [Q(pk__in=[])]
+        return [Q(**{f"{prefix}id__in": cls.membership_ids(user)})]
+
+    @classmethod
     def get_queryset(cls, queryset, user):
-        queryset = cls.filter_queryset(queryset)
-        if isinstance(user, ResolveInfo):
-            user = user.context.user
-        if settings.ROW_SECURITY and user.is_anonymous:
+        """Policy holders in the user's districts, and the ones the user is attached to.
+
+        Membership widens the rows only; the right is still checked by every
+        caller. A portal user usually has no district at all, and sees their own
+        policy holders through the second term.
+        """
+        # Row security only: whether deleted rows are in scope is decided by the
+        # resolvers through append_validity_filter, which sees the isDeleted
+        # argument this method never gets (follow-up of OP-3180).
+        if queryset is None:
+            queryset = cls.objects.all()
+        user = cls.scoping_user(user)
+        if user is None or user.is_anonymous:
             return queryset.filter(id=None)
-        if settings.ROW_SECURITY:
-            return LocationManager().build_user_location_filter_query(user._u, queryset=queryset, prefix='locations')
-        return queryset
+        if not settings.ROW_SECURITY:
+            return queryset
+        in_districts = LocationManager().build_user_location_filter_query(user._u, prefix='locations')
+        if not in_districts:
+            # Superuser or technical user: the location filter does not apply.
+            return queryset
+        return queryset.filter(in_districts | Q(id__in=cls.membership_ids(user)))
 
     class Meta:
         db_table = 'tblPolicyHolder'
@@ -60,6 +122,9 @@ class PolicyHolderInsureeManager(core_models.HistoryModelManager):
 
 
 class PolicyHolderInsuree(core_models.HistoryBusinessModel):
+    # As visible as its policy holder (districts or membership).
+    row_scope = core_models.ParentScope("policy_holder")
+
     policy_holder = models.ForeignKey(PolicyHolder, db_column='PolicyHolderId',
                                       on_delete=models.deletion.DO_NOTHING)
     insuree = models.ForeignKey(Insuree, db_column='InsureeId',
@@ -68,18 +133,24 @@ class PolicyHolderInsuree(core_models.HistoryBusinessModel):
                                                  on_delete=models.deletion.DO_NOTHING, blank=True, null=True)
     last_policy = models.ForeignKey(Policy, db_column='LastPolicyId', on_delete=models.deletion.DO_NOTHING, blank=True, null=True)
 
+    # Four foreign keys, a single owner: `insuree`, `contribution_plan_bundle` and
+    # `last_policy` denote shared objects this row references, while `policy_holder` is
+    # the one it is part of. The parent is declared and not inferred, precisely because
+    # nothing in the FKs distinguishes "belongs to" from "references".
+    #
+    # The entity keeps rights of its own (block 1502xx): `scope_parent` therefore only
+    # serves as a fallback for an action this entity does not declare, and above all as
+    # a declaration of ownership for the per-row check.
+    scope_parent = "policy_holder"
+
     objects = PolicyHolderInsureeManager()
 
     @classmethod
-    def get_queryset(cls, queryset, user):
-        queryset = cls.filter_queryset(queryset)
-        if isinstance(user, ResolveInfo):
-            user = user.context.user
-        if settings.ROW_SECURITY and user.is_anonymous:
-            return queryset.filter(id=None)
-        if settings.ROW_SECURITY:
-            pass
-        return queryset
+    def get_rights(cls, action):
+        """Access point to the rights of the `policyHolderInsuree` entity."""
+        from policyholder.apps import configured_perms
+
+        return configured_perms("policyHolderInsuree", action)
 
     class Meta:
         db_table = 'tblPolicyHolderInsuree'
@@ -95,23 +166,33 @@ class PolicyHolderContributionPlanManager(core_models.HistoryModelManager):
 
 
 class PolicyHolderContributionPlan(core_models.HistoryBusinessModel):
+    # As visible as its policy holder (districts or membership).
+    row_scope = core_models.ParentScope("policy_holder")
+
     policy_holder = models.ForeignKey(PolicyHolder, db_column='PolicyHolderId',
                                       on_delete=models.deletion.DO_NOTHING)
     contribution_plan_bundle = models.ForeignKey(ContributionPlanBundle, db_column='ContributionPlanBundleId',
                                                  on_delete=models.deletion.DO_NOTHING)
 
+    # Two FKs that look alike: `contribution_plan_bundle` is a catalogue shared
+    # between policy holders, `policy_holder` is the one this assignment is part of.
+    # The latter is what governs who may read or modify it.
+    scope_parent = "policy_holder"
+
     objects = PolicyHolderContributionPlanManager()
 
     @classmethod
-    def get_queryset(cls, queryset, user):
-        queryset = cls.filter_queryset(queryset)
-        if isinstance(user, ResolveInfo):
-            user = user.context.user
-        if settings.ROW_SECURITY and user.is_anonymous:
-            return queryset.filter(id=None)
-        if settings.ROW_SECURITY:
-            pass
-        return queryset
+    def get_rights(cls, action):
+        """
+        Access point to the rights of the `policyHolderContributionPlanBundle` entity.
+
+        The entity's name is the config's and the openIMIS catalogue's, not the
+        model's: the `_perms` keys speak of `policyholdercontributionplanbundle` for
+        reading and of `policyholdercontributionplan` for the mutations.
+        """
+        from policyholder.apps import configured_perms
+
+        return configured_perms("policyHolderContributionPlanBundle", action)
 
     class Meta:
         db_table = 'tblPolicyHolderContributionPlan'
@@ -127,6 +208,9 @@ class PolicyHolderUserManager(core_models.HistoryModelManager):
 
 
 class PolicyHolderUser(core_models.HistoryBusinessModel):
+    # As visible as its policy holder (districts or membership).
+    row_scope = core_models.ParentScope("policy_holder")
+
     user = models.ForeignKey(
         core_models.User,
         db_column='UserID',
@@ -135,18 +219,20 @@ class PolicyHolderUser(core_models.HistoryBusinessModel):
     policy_holder = models.ForeignKey(PolicyHolder, db_column='PolicyHolderId',
                                       on_delete=models.deletion.DO_NOTHING)
 
+    # Two FKs, and `policy_holder` is the one that owns the row: attaching a user to
+    # the portal means administering that policy holder, not the user - who exists
+    # independently and may be attached to several policy holders.
+    # `has_hybrid_phu_perms` below reads this same relation to decide membership.
+    scope_parent = "policy_holder"
+
     objects = PolicyHolderUserManager()
 
     @classmethod
-    def get_queryset(cls, queryset, user):
-        queryset = cls.filter_queryset(queryset)
-        if isinstance(user, ResolveInfo):
-            user = user.context.user
-        if settings.ROW_SECURITY and user.is_anonymous:
-            return queryset.filter(id=None)
-        if settings.ROW_SECURITY:
-            pass
-        return queryset
+    def get_rights(cls, action):
+        """Access point to the rights of the `policyHolderUser` entity."""
+        from policyholder.apps import configured_perms
+
+        return configured_perms("policyHolderUser", action)
 
     class Meta:
         db_table = 'tblPolicyHolderUser'
